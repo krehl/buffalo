@@ -22,9 +22,12 @@ import (
 const vendorPattern = "/vendor/"
 
 var vendorRegex = regexp.MustCompile(vendorPattern)
+var forceMigrations = false
 
 func init() {
 	decorate("test", testCmd)
+	testCmd.Flags().BoolVarP(&forceMigrations, "force-migrations", "m", false, "skips loading the schema and instead runs migrations before running tests")
+
 	RootCmd.AddCommand(testCmd)
 }
 
@@ -50,6 +53,20 @@ var testCmd = &cobra.Command{
 				return errors.WithStack(err)
 			}
 
+			if forceMigrations {
+				fm, err := pop.NewFileMigrator("./migrations", test)
+
+				if err != nil {
+					return err
+				}
+
+				if err := fm.Up(); err != nil {
+					return err
+				}
+
+				return testRunner(args)
+			}
+
 			if schema := findSchema(); schema != nil {
 				err = test.Dialect.LoadSchema(schema)
 				if err != nil {
@@ -73,7 +90,12 @@ func findSchema() io.Reader {
 	}
 
 	if test, err := pop.Connect("test"); err == nil {
-		if err := test.MigrateUp("./migrations"); err == nil {
+		fm, err := pop.NewFileMigrator("./migrations", test)
+		if err != nil {
+			return nil
+		}
+
+		if err := fm.Up(); err == nil {
 			if f, err := os.Open(filepath.Join("migrations", "schema.sql")); err == nil {
 				return f
 			}
@@ -84,16 +106,15 @@ func findSchema() io.Reader {
 
 func testRunner(args []string) error {
 	var mFlag bool
+	var query string
 	cargs := []string{}
 	pargs := []string{}
 	var larg string
 	for i, a := range args {
 		switch a {
-		case "-run":
-			cargs = append(cargs, "-run", args[i+1])
-		case "-m":
+		case "-run", "-m":
+			query = args[i+1]
 			mFlag = true
-			cargs = append(cargs, "-testify.m", args[i+1])
 		case "-v":
 			cargs = append(cargs, "-v")
 		default:
@@ -106,7 +127,11 @@ func testRunner(args []string) error {
 
 	cmd := newTestCmd(cargs)
 	if mFlag {
-		return mFlagRunner(cargs, pargs)
+		return mFlagRunner{
+			query: query,
+			args:  cargs,
+			pargs: pargs,
+		}.Run()
 	}
 
 	pkgs, err := testPackages(pargs)
@@ -118,12 +143,18 @@ func testRunner(args []string) error {
 	return cmd.Run()
 }
 
-func mFlagRunner(args []string, pargs []string) error {
+type mFlagRunner struct {
+	query string
+	args  []string
+	pargs []string
+}
+
+func (m mFlagRunner) Run() error {
 	app := meta.New(".")
 	pwd, _ := os.Getwd()
 	defer os.Chdir(pwd)
 
-	pkgs, err := testPackages(pargs)
+	pkgs, err := testPackages(m.pargs)
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -133,10 +164,16 @@ func mFlagRunner(args []string, pargs []string) error {
 		if p == app.PackagePkg {
 			continue
 		}
-		cmd := newTestCmd(args)
 		p = strings.TrimPrefix(p, app.PackagePkg+string(filepath.Separator))
-		logrus.Info(strings.Join(cmd.Args, " "))
 		os.Chdir(p)
+
+		cmd := newTestCmd(m.args)
+		if hasTestify(p) {
+			cmd.Args = append(cmd.Args, "-testify.m", m.query)
+		} else {
+			cmd.Args = append(cmd.Args, "-run", m.query)
+		}
+		logrus.Info(strings.Join(cmd.Args, " "))
 		if err := cmd.Run(); err != nil {
 			errs = true
 		}
@@ -145,6 +182,12 @@ func mFlagRunner(args []string, pargs []string) error {
 		return errors.New("errors running tests")
 	}
 	return nil
+}
+
+func hasTestify(p string) bool {
+	cmd := exec.Command("go", "test", "-thisflagdoesntexist")
+	b, _ := cmd.Output()
+	return bytes.Contains(b, []byte("-testify.m"))
 }
 
 func testPackages(givenArgs []string) ([]string, error) {
